@@ -1,5 +1,5 @@
 {
-	"name": "tauri-plugin-7otion-sqlite-api",
+	"name": "@7otion/tauri-plugin-sqlite-api",
 	"version": "0.1.0",
 	"description": "JavaScript API for tauri-plugin-7otion-sqlite.",
 	"author": "Burak Kartal",

@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "tauri-plugin-7otion-sqlite-api",
+      "name": "@7otion/tauri-plugin-sqlite-api",
       "devDependencies": {
         "@tauri-apps/api": "^2.11.1",
         "typescript": "^6.0.3",

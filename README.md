@@ -13,7 +13,7 @@ tauri-plugin-7otion-sqlite = { git = "https://github.com/7otion/tauri-plugin-7ot
 ```
 
 ```json
-"tauri-plugin-7otion-sqlite-api": "github:7otion/tauri-plugin-7otion-sqlite"
+"@7otion/tauri-plugin-sqlite-api": "github:7otion/tauri-plugin-7otion-sqlite"
 ```
 
 ```rust
@@ -25,7 +25,7 @@ Add `"7otion-sqlite:default"` to your capability's permissions.
 ## JavaScript
 
 ```ts
-import { Database } from 'tauri-plugin-7otion-sqlite-api';
+import { Database } from '@7otion/tauri-plugin-sqlite-api';
 
 const db = await Database.load('app.sqlite', { pragmas: { busy_timeout: 10000 } });
 
