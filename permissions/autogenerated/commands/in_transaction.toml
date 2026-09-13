@@ -1,0 +1,13 @@
+# Automatically generated - DO NOT EDIT!
+
+"$schema" = "../../schemas/schema.json"
+
+[[permission]]
+identifier = "allow-in-transaction"
+description = "Enables the in_transaction command without any pre-configured scope."
+commands.allow = ["in_transaction"]
+
+[[permission]]
+identifier = "deny-in-transaction"
+description = "Denies the in_transaction command without any pre-configured scope."
+commands.deny = ["in_transaction"]
