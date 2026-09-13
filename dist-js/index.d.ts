@@ -10,8 +10,9 @@ export interface ExecuteResult {
     rowsAffected: number;
     lastInsertId: number;
 }
-/** A connection to one database file, shared by every `load` of that file. */
+/** One handle to a database file's connection, which every `load` of that file shares. */
 export declare class Database {
+    private readonly handle;
     readonly path: string;
     private constructor();
     /**
@@ -24,7 +25,10 @@ export declare class Database {
     execute(sql: string, params?: BindValue[]): Promise<ExecuteResult>;
     /** The database's own state, not a flag kept in JavaScript. */
     inTransaction(): Promise<boolean>;
-    /** Closes the connection for every handle to this file. */
+    /**
+     * Releases this handle, rolling back a transaction it began. The connection closes once no
+     * handle and no Rust `load` still holds it.
+     */
     close(): Promise<void>;
     private static config;
 }

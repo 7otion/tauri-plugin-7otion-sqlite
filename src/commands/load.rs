@@ -1,15 +1,23 @@
-use tauri::State;
+use serde::Serialize;
+use tauri::{Runtime, State, Webview};
 
 use crate::config::DatabaseConfig;
-use crate::databases::Databases;
+use crate::databases::{Databases, HandleId};
 use crate::error::Result;
 
+#[derive(Serialize)]
+pub(crate) struct Loaded {
+    handle: HandleId,
+    path: String,
+}
+
 #[tauri::command]
-pub(crate) async fn load(
+pub(crate) async fn load<R: Runtime>(
+    webview: Webview<R>,
     databases: State<'_, Databases>,
     path: String,
     config: Option<DatabaseConfig>,
-) -> Result<String> {
+) -> Result<Loaded> {
     if config.as_ref().is_some_and(|config| config.key.is_some()) {
         tracing::warn!(
             path,
@@ -18,12 +26,12 @@ pub(crate) async fn load(
         );
     }
 
-    let database = databases.load(&path, config).await?;
+    let (handle, database) = databases
+        .load_handle(&path, config, webview.label())
+        .await?;
 
-    // A page loads each database once, so a transaction open here belongs to a page that is gone.
-    if database.roll_back_leftover_transaction().await? {
-        tracing::warn!(database = %database.id(), "rolled back a transaction left open by a previous page");
-    }
-
-    Ok(database.id().to_owned())
+    Ok(Loaded {
+        handle,
+        path: database.id().to_owned(),
+    })
 }

@@ -34,13 +34,13 @@ const users = await db.select<{ id: number; name: string }>('SELECT * FROM users
 ```
 
 A relative path resolves against the app data directory. Every `load` of the
-same file shares one connection: not open, it opens with the given options;
-open, it attaches when no options or the same options are given, and throws on
-different ones — `close()` it and load it again. `close()` closes the connection
-for every handle to that file.
+same file returns a new handle to one shared connection: not open, it opens with
+the given options; open, it attaches when no options or the same options are
+given, and throws on different ones.
 
-Load each database once and share the handle: `load` rolls back a transaction
-left open, taking it for one a reloaded page abandoned.
+`close()` releases its handle and rolls back a transaction that handle began.
+The connection closes once no handle and no Rust `load` holds it. When a page
+reloads, every handle it held is released the same way.
 
 Connections start with `journal_mode = WAL`, `foreign_keys = ON`,
 `synchronous = NORMAL` and a 5 second `busy_timeout`; `pragmas` replace them by
@@ -59,6 +59,9 @@ let db = app.sqlite().load("app.sqlite", None).await?;
 let mut connection = db.lock().await?; // &mut sqlx::SqliteConnection
 sqlx::query("DELETE FROM sessions").execute(&mut *connection).await?;
 ```
+
+A Rust `load` keeps the database open until `app.sqlite().close(db.id())`, which
+closes it outright and ends every JavaScript handle to it.
 
 JavaScript and Rust share each connection, so Rust statements run inside any
 transaction JavaScript has open. Statements are logged with `tracing` at debug

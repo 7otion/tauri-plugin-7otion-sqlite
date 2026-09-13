@@ -8,6 +8,7 @@ use sqlx::{Column, ConnectOptions, Connection, Row};
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::config::DatabaseConfig;
+use crate::databases::HandleId;
 use crate::error::{Error, Result};
 use crate::value;
 
@@ -15,7 +16,13 @@ use crate::value;
 pub struct Database {
     id: String,
     config: DatabaseConfig,
-    connection: Mutex<Option<SqliteConnection>>,
+    open: Mutex<Option<Open>>,
+}
+
+struct Open {
+    connection: SqliteConnection,
+    /// The handle whose statement began the open transaction.
+    transaction_owner: Option<HandleId>,
 }
 
 /// A query result as column names plus positional rows, so names are not repeated per row.
@@ -39,7 +46,10 @@ impl Database {
         Ok(Self {
             id,
             config,
-            connection: Mutex::new(Some(connection)),
+            open: Mutex::new(Some(Open {
+                connection,
+                transaction_owner: None,
+            })),
         })
     }
 
@@ -50,7 +60,7 @@ impl Database {
 
     /// The connection, held until the guard drops; everything else on this database waits.
     pub async fn lock(&self) -> Result<ConnectionGuard<'_>> {
-        let guard = self.connection.lock().await;
+        let guard = self.open.lock().await;
         if guard.is_none() {
             return Err(Error::Closed(self.id.clone()));
         }
@@ -94,8 +104,13 @@ impl Database {
         Ok(Rows { columns, rows })
     }
 
-    pub(crate) async fn execute(&self, sql: &str, params: Vec<JsonValue>) -> Result<Execution> {
-        tracing::debug!(database = %self.id, sql, params = params.len(), "execute");
+    pub(crate) async fn execute(
+        &self,
+        handle: HandleId,
+        sql: &str,
+        params: Vec<JsonValue>,
+    ) -> Result<Execution> {
+        tracing::debug!(database = %self.id, handle, sql, params = params.len(), "execute");
 
         let mut query = sqlx::query(sql);
         for param in params {
@@ -103,8 +118,18 @@ impl Database {
         }
 
         let mut connection = self.lock().await?;
-        let result = query.execute(&mut *connection).await?;
+        let result = query.execute(&mut *connection).await;
 
+        // Checked even when the statement failed: SQLite may have ended the transaction itself.
+        let in_transaction = Self::transaction_open(&mut connection).await?;
+        let owner = connection.transaction_owner();
+        *owner = match (in_transaction, *owner) {
+            (false, _) => None,
+            (true, None) => Some(handle),
+            (true, current) => current,
+        };
+
+        let result = result?;
         Ok(Execution {
             rows_affected: result.rows_affected(),
             last_insert_id: result.last_insert_rowid(),
@@ -116,20 +141,29 @@ impl Database {
         Self::transaction_open(&mut connection).await
     }
 
-    /// Rolls back a transaction no caller can still own, such as one a reloaded page left open.
-    pub(crate) async fn roll_back_leftover_transaction(&self) -> Result<bool> {
-        let mut connection = self.lock().await?;
+    /// Rolls back the open transaction if `handle` began it; reports whether it did.
+    pub(crate) async fn release_transaction(&self, handle: HandleId) -> Result<bool> {
+        let mut connection = match self.lock().await {
+            Ok(connection) => connection,
+            Err(Error::Closed(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+
+        if *connection.transaction_owner() != Some(handle) {
+            return Ok(false);
+        }
+        *connection.transaction_owner() = None;
+
         if !Self::transaction_open(&mut connection).await? {
             return Ok(false);
         }
-
         sqlx::query("ROLLBACK").execute(&mut *connection).await?;
         Ok(true)
     }
 
     pub(crate) async fn close(&self) -> Result<()> {
-        if let Some(connection) = self.connection.lock().await.take() {
-            connection.close().await?;
+        if let Some(open) = self.open.lock().await.take() {
+            open.connection.close().await?;
         }
         Ok(())
     }
@@ -144,22 +178,34 @@ impl Database {
 }
 
 /// Exclusive use of a database's connection; the next caller waits until it drops.
-pub struct ConnectionGuard<'a>(MutexGuard<'a, Option<SqliteConnection>>);
+pub struct ConnectionGuard<'a>(MutexGuard<'a, Option<Open>>);
+
+impl ConnectionGuard<'_> {
+    fn transaction_owner(&mut self) -> &mut Option<HandleId> {
+        &mut self.open_mut().transaction_owner
+    }
+
+    fn open_mut(&mut self) -> &mut Open {
+        self.0
+            .as_mut()
+            .expect("a guard is only made for an open connection")
+    }
+}
 
 impl Deref for ConnectionGuard<'_> {
     type Target = SqliteConnection;
 
     fn deref(&self) -> &SqliteConnection {
-        self.0
+        &self
+            .0
             .as_ref()
             .expect("a guard is only made for an open connection")
+            .connection
     }
 }
 
 impl DerefMut for ConnectionGuard<'_> {
     fn deref_mut(&mut self) -> &mut SqliteConnection {
-        self.0
-            .as_mut()
-            .expect("a guard is only made for an open connection")
+        &mut self.open_mut().connection
     }
 }

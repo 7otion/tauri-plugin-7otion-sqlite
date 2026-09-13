@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -8,66 +8,192 @@ use crate::config::DatabaseConfig;
 use crate::database::Database;
 use crate::error::{Error, Result};
 
-/// Every database the app has open, one connection per file.
+/// Identifies one JavaScript `load` of a database.
+pub(crate) type HandleId = u64;
+
+/// Every database the app has open, one connection per file, and who holds each.
 pub struct Databases {
     data_directory: Option<PathBuf>,
-    open: Mutex<HashMap<String, Arc<Database>>>,
+    registry: Mutex<Registry>,
+}
+
+struct Registry {
+    databases: HashMap<String, Entry>,
+    handles: HashMap<HandleId, Handle>,
+    next_handle: HandleId,
+}
+
+struct Entry {
+    database: Arc<Database>,
+    handles: HashSet<HandleId>,
+    /// Loaded from Rust, which keeps it open until Rust closes it.
+    held_by_rust: bool,
+}
+
+struct Handle {
+    database_id: String,
+    webview: String,
 }
 
 impl Databases {
     pub(crate) fn new(data_directory: Option<PathBuf>) -> Self {
         Self {
             data_directory,
-            open: Mutex::new(HashMap::new()),
+            registry: Mutex::new(Registry {
+                databases: HashMap::new(),
+                handles: HashMap::new(),
+                next_handle: 1,
+            }),
         }
     }
 
-    /// Opens `path`, or attaches to its open connection. With no config it attaches whatever
-    /// the database was opened with; a config must match that exactly.
+    /// Opens `path`, or attaches to its open connection, and keeps it open until [`Self::close`].
+    /// With no config it attaches whatever the database was opened with; a config must match that.
     pub async fn load(
         &self,
         path: impl AsRef<Path>,
         config: Option<DatabaseConfig>,
     ) -> Result<Arc<Database>> {
-        let path = self.resolve(path.as_ref())?;
-        let id = Self::identity(&path)?;
-
-        let mut open = self.open.lock().await;
-
-        if let Some(database) = open.get(&id) {
-            return match config {
-                Some(config) if &config != database.config() => Err(Error::ConfigMismatch(id)),
-                _ => Ok(database.clone()),
-            };
-        }
-
-        let database =
-            Arc::new(Database::open(id.clone(), &path, config.unwrap_or_default()).await?);
-        open.insert(id, database.clone());
-        tracing::info!(database = %database.id(), "opened");
-
-        Ok(database)
+        let mut registry = self.registry.lock().await;
+        let entry = self.entry(&mut registry, path.as_ref(), config).await?;
+        entry.held_by_rust = true;
+        Ok(entry.database.clone())
     }
 
-    /// An open database, by the id `load` gave it.
-    pub async fn get(&self, id: &str) -> Result<Arc<Database>> {
-        self.open
-            .lock()
-            .await
-            .get(id)
-            .cloned()
-            .ok_or_else(|| Error::NotLoaded(id.to_owned()))
-    }
-
-    /// Closes the connection for every holder; closing one that is not open does nothing.
+    /// Closes the connection outright, ending every handle to it; closing one not open does nothing.
     pub async fn close(&self, id: &str) -> Result<()> {
-        let database = self.open.lock().await.remove(id);
+        let mut registry = self.registry.lock().await;
 
-        if let Some(database) = database {
-            database.close().await?;
+        if let Some(entry) = registry.databases.remove(id) {
+            registry
+                .handles
+                .retain(|_, handle| handle.database_id != id);
+            entry.database.close().await?;
             tracing::info!(database = %id, "closed");
         }
         Ok(())
+    }
+
+    pub(crate) async fn load_handle(
+        &self,
+        path: &str,
+        config: Option<DatabaseConfig>,
+        webview: &str,
+    ) -> Result<(HandleId, Arc<Database>)> {
+        let mut registry = self.registry.lock().await;
+        let handle = registry.next_handle;
+
+        let entry = self.entry(&mut registry, Path::new(path), config).await?;
+        entry.handles.insert(handle);
+        let database = entry.database.clone();
+
+        registry.next_handle += 1;
+        registry.handles.insert(
+            handle,
+            Handle {
+                database_id: database.id().to_owned(),
+                webview: webview.to_owned(),
+            },
+        );
+
+        Ok((handle, database))
+    }
+
+    pub(crate) async fn handle(&self, handle: HandleId) -> Result<Arc<Database>> {
+        let registry = self.registry.lock().await;
+
+        registry
+            .handles
+            .get(&handle)
+            .and_then(|held| registry.databases.get(&held.database_id))
+            .map(|entry| entry.database.clone())
+            .ok_or(Error::UnknownHandle(handle))
+    }
+
+    /// Releasing a handle twice does nothing.
+    pub(crate) async fn release(&self, handle: HandleId) -> Result<()> {
+        let mut registry = self.registry.lock().await;
+
+        match registry.handles.remove(&handle) {
+            Some(held) => Self::release_from(&mut registry, handle, &held.database_id).await,
+            None => Ok(()),
+        }
+    }
+
+    /// For a page that is being replaced, whose handles will never be released.
+    pub(crate) async fn release_webview(&self, webview: &str) -> Result<()> {
+        let mut registry = self.registry.lock().await;
+
+        let owned: Vec<(HandleId, String)> = registry
+            .handles
+            .iter()
+            .filter(|(_, held)| held.webview == webview)
+            .map(|(handle, held)| (*handle, held.database_id.clone()))
+            .collect();
+
+        for (handle, database_id) in owned {
+            registry.handles.remove(&handle);
+            Self::release_from(&mut registry, handle, &database_id).await?;
+        }
+        Ok(())
+    }
+
+    async fn release_from(
+        registry: &mut Registry,
+        handle: HandleId,
+        database_id: &str,
+    ) -> Result<()> {
+        let Some(entry) = registry.databases.get_mut(database_id) else {
+            return Ok(());
+        };
+        entry.handles.remove(&handle);
+        let database = entry.database.clone();
+        let unheld = entry.handles.is_empty() && !entry.held_by_rust;
+
+        if database.release_transaction(handle).await? {
+            tracing::warn!(database = %database_id, handle, "rolled back a transaction its handle left open");
+        }
+
+        if unheld {
+            registry.databases.remove(database_id);
+            database.close().await?;
+            tracing::info!(database = %database_id, "closed");
+        }
+        Ok(())
+    }
+
+    async fn entry<'r>(
+        &self,
+        registry: &'r mut Registry,
+        path: &Path,
+        config: Option<DatabaseConfig>,
+    ) -> Result<&'r mut Entry> {
+        let path = self.resolve(path)?;
+        let id = Self::identity(&path)?;
+
+        if let Some(entry) = registry.databases.get(&id) {
+            if let Some(config) = config
+                && &config != entry.database.config()
+            {
+                return Err(Error::ConfigMismatch(id));
+            }
+        } else {
+            let database = Database::open(id.clone(), &path, config.unwrap_or_default()).await?;
+            tracing::info!(database = %id, "opened");
+            registry.databases.insert(
+                id.clone(),
+                Entry {
+                    database: Arc::new(database),
+                    handles: HashSet::new(),
+                    held_by_rust: false,
+                },
+            );
+        }
+
+        Ok(registry
+            .databases
+            .get_mut(&id)
+            .expect("the entry was found or inserted above"))
     }
 
     fn resolve(&self, path: &Path) -> Result<PathBuf> {

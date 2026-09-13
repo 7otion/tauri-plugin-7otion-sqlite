@@ -5,7 +5,11 @@ use std::sync::Arc;
 use serde_json::{Value as JsonValue, json};
 
 use crate::database::Database;
+use crate::databases::HandleId;
 use crate::{DatabaseConfig, Databases, Error};
+
+/// Statements issued from Rust, which no handle owns.
+const FROM_RUST: HandleId = 0;
 
 struct TempDirectory(PathBuf);
 
@@ -40,17 +44,19 @@ async fn scalar(database: &Database, sql: &str, params: Vec<JsonValue>) -> JsonV
     rows.remove(0).remove(0)
 }
 
+async fn exec(database: &Database, handle: HandleId, sql: &str) {
+    database.execute(handle, sql, vec![]).await.unwrap();
+}
+
 #[test]
 fn values_round_trip() {
     let directory = TempDirectory::new("values");
     run(async {
         let database = directory.databases().load("a.sqlite", None).await.unwrap();
-        database
-            .execute("CREATE TABLE t (a, b, c, d, e)", vec![])
-            .await
-            .unwrap();
+        exec(&database, FROM_RUST, "CREATE TABLE t (a, b, c, d, e)").await;
         database
             .execute(
+                FROM_RUST,
                 "INSERT INTO t VALUES (?, ?, ?, ?, ?)",
                 vec![
                     json!(null),
@@ -133,10 +139,7 @@ fn an_empty_result_has_no_columns() {
     let directory = TempDirectory::new("empty");
     run(async {
         let database = directory.databases().load("a.sqlite", None).await.unwrap();
-        database
-            .execute("CREATE TABLE t (a)", vec![])
-            .await
-            .unwrap();
+        exec(&database, FROM_RUST, "CREATE TABLE t (a)").await;
 
         let result = database.select("SELECT * FROM t", vec![]).await.unwrap();
 
@@ -151,20 +154,23 @@ fn execute_reports_rows_affected_and_the_last_insert_id() {
     let directory = TempDirectory::new("execute");
     run(async {
         let database = directory.databases().load("a.sqlite", None).await.unwrap();
-        database
-            .execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a)", vec![])
-            .await
-            .unwrap();
+        exec(
+            &database,
+            FROM_RUST,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a)",
+        )
+        .await;
 
         let inserted = database
             .execute(
+                FROM_RUST,
                 "INSERT INTO t (a) VALUES (?), (?)",
                 vec![json!(1), json!(2)],
             )
             .await
             .unwrap();
         let updated = database
-            .execute("UPDATE t SET a = 0", vec![])
+            .execute(FROM_RUST, "UPDATE t SET a = 0", vec![])
             .await
             .unwrap();
 
@@ -259,10 +265,7 @@ fn a_key_encrypts_the_file() {
         let keyed = Some(DatabaseConfig::new().key("it's secret"));
 
         let database = databases.load("a.sqlite", keyed.clone()).await.unwrap();
-        database
-            .execute("CREATE TABLE t (a)", vec![])
-            .await
-            .unwrap();
+        exec(&database, FROM_RUST, "CREATE TABLE t (a)").await;
         databases.close(database.id()).await.unwrap();
 
         let unkeyed = databases.load("a.sqlite", None).await.unwrap();
@@ -348,74 +351,173 @@ fn loading_an_open_database_compares_configs() {
 }
 
 #[test]
-fn closing_affects_every_holder_and_only_that_file() {
+fn a_transaction_spans_calls_and_rolls_back() {
+    let directory = TempDirectory::new("transaction");
+    run(async {
+        let database = directory.databases().load("a.sqlite", None).await.unwrap();
+        exec(&database, FROM_RUST, "CREATE TABLE t (a)").await;
+
+        assert!(!database.in_transaction().await.unwrap());
+        exec(&database, FROM_RUST, "BEGIN").await;
+        assert!(database.in_transaction().await.unwrap());
+        exec(&database, FROM_RUST, "INSERT INTO t VALUES (1)").await;
+        exec(&database, FROM_RUST, "ROLLBACK").await;
+        assert!(!database.in_transaction().await.unwrap());
+
+        assert_eq!(
+            scalar(&database, "SELECT count(*) FROM t", vec![]).await,
+            json!(0)
+        );
+        database.close().await.unwrap();
+    });
+}
+
+#[test]
+fn handles_share_the_connection_until_the_last_is_released() {
+    let directory = TempDirectory::new("handles");
+    run(async {
+        let databases = directory.databases();
+        let (first, database) = databases
+            .load_handle("a.sqlite", None, "main")
+            .await
+            .unwrap();
+        let (second, same) = databases
+            .load_handle("a.sqlite", None, "main")
+            .await
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&database, &same));
+        assert_ne!(first, second);
+
+        databases.release(first).await.unwrap();
+        assert!(databases.handle(first).await.is_err());
+        assert!(databases.handle(second).await.is_ok());
+        assert!(database.lock().await.is_ok());
+
+        databases.release(second).await.unwrap();
+        databases.release(second).await.unwrap();
+        assert!(matches!(
+            databases.handle(second).await,
+            Err(Error::UnknownHandle(_))
+        ));
+        assert!(matches!(database.lock().await, Err(Error::Closed(_))));
+    });
+}
+
+#[test]
+fn a_database_loaded_from_rust_outlives_its_handles() {
+    let directory = TempDirectory::new("rust-held");
+    run(async {
+        let databases = directory.databases();
+        let database = databases.load("a.sqlite", None).await.unwrap();
+        let (handle, _) = databases
+            .load_handle("a.sqlite", None, "main")
+            .await
+            .unwrap();
+
+        databases.release(handle).await.unwrap();
+
+        assert!(database.lock().await.is_ok());
+        databases.close(database.id()).await.unwrap();
+    });
+}
+
+#[test]
+fn closing_from_rust_ends_every_handle_and_only_that_file() {
     let directory = TempDirectory::new("close");
     run(async {
         let databases = directory.databases();
         let a = databases.load("a.sqlite", None).await.unwrap();
+        let (handle, _) = databases
+            .load_handle("a.sqlite", None, "main")
+            .await
+            .unwrap();
         let b = databases.load("b.sqlite", None).await.unwrap();
-        let id = a.id().to_owned();
 
-        databases.close(&id).await.unwrap();
+        databases.close(a.id()).await.unwrap();
 
         assert!(matches!(a.lock().await, Err(Error::Closed(_))));
-        assert!(matches!(databases.get(&id).await, Err(Error::NotLoaded(_))));
-        assert!(databases.close(&id).await.is_ok());
+        assert!(matches!(
+            databases.handle(handle).await,
+            Err(Error::UnknownHandle(_))
+        ));
+        assert!(databases.close(a.id()).await.is_ok());
         assert_eq!(scalar(&b, "SELECT 1", vec![]).await, json!(1));
         databases.close(b.id()).await.unwrap();
     });
 }
 
 #[test]
-fn a_transaction_spans_calls_and_rolls_back() {
-    let directory = TempDirectory::new("transaction");
+fn releasing_a_webview_releases_only_its_handles() {
+    let directory = TempDirectory::new("webview");
     run(async {
-        let database = directory.databases().load("a.sqlite", None).await.unwrap();
-        database
-            .execute("CREATE TABLE t (a)", vec![])
+        let databases = directory.databases();
+        let (main, _) = databases
+            .load_handle("a.sqlite", None, "main")
+            .await
+            .unwrap();
+        let (other, database) = databases
+            .load_handle("a.sqlite", None, "other")
             .await
             .unwrap();
 
-        assert!(!database.in_transaction().await.unwrap());
-        database.execute("BEGIN", vec![]).await.unwrap();
-        assert!(database.in_transaction().await.unwrap());
-        database
-            .execute("INSERT INTO t VALUES (1)", vec![])
-            .await
-            .unwrap();
-        database.execute("ROLLBACK", vec![]).await.unwrap();
-        assert!(!database.in_transaction().await.unwrap());
+        databases.release_webview("main").await.unwrap();
 
-        assert_eq!(
-            scalar(&database, "SELECT count(*) FROM t", vec![]).await,
-            json!(0)
-        );
-        database.close().await.unwrap();
+        assert!(databases.handle(main).await.is_err());
+        assert!(databases.handle(other).await.is_ok());
+        databases.close(database.id()).await.unwrap();
     });
 }
 
 #[test]
-fn a_leftover_transaction_is_rolled_back() {
-    let directory = TempDirectory::new("leftover");
+fn a_released_handle_rolls_back_only_the_transaction_it_began() {
+    let directory = TempDirectory::new("owner");
     run(async {
-        let database = directory.databases().load("a.sqlite", None).await.unwrap();
-        database
-            .execute("CREATE TABLE t (a)", vec![])
+        let databases = directory.databases();
+        let database = databases.load("a.sqlite", None).await.unwrap();
+        let (owner, _) = databases
+            .load_handle("a.sqlite", None, "main")
             .await
             .unwrap();
-        database.execute("BEGIN", vec![]).await.unwrap();
-        database
-            .execute("INSERT INTO t VALUES (1)", vec![])
+        let (bystander, _) = databases
+            .load_handle("a.sqlite", None, "main")
             .await
             .unwrap();
+        exec(&database, owner, "CREATE TABLE t (a)").await;
+        exec(&database, owner, "BEGIN").await;
+        exec(&database, bystander, "INSERT INTO t VALUES (1)").await;
 
-        assert!(database.roll_back_leftover_transaction().await.unwrap());
-        assert!(!database.roll_back_leftover_transaction().await.unwrap());
+        databases.release(bystander).await.unwrap();
+        assert!(database.in_transaction().await.unwrap());
+
+        databases.release(owner).await.unwrap();
+        assert!(!database.in_transaction().await.unwrap());
         assert_eq!(
             scalar(&database, "SELECT count(*) FROM t", vec![]).await,
             json!(0)
         );
-        database.close().await.unwrap();
+        databases.close(database.id()).await.unwrap();
+    });
+}
+
+#[test]
+fn loading_leaves_an_open_transaction_alone() {
+    let directory = TempDirectory::new("load-in-transaction");
+    run(async {
+        let databases = directory.databases();
+        let (owner, database) = databases
+            .load_handle("a.sqlite", None, "main")
+            .await
+            .unwrap();
+        exec(&database, owner, "BEGIN").await;
+
+        let (_, _) = databases
+            .load_handle("a.sqlite", None, "main")
+            .await
+            .unwrap();
+
+        assert!(database.in_transaction().await.unwrap());
+        databases.close(database.id()).await.unwrap();
     });
 }
 

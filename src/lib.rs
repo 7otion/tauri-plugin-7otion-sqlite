@@ -17,6 +17,7 @@ pub use databases::Databases;
 pub use error::{Error, Result};
 
 use tauri::plugin::{Builder, TauriPlugin};
+use tauri::webview::PageLoadEvent;
 use tauri::{Manager, Runtime};
 
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
@@ -31,6 +32,19 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
         .setup(|app, _api| {
             app.manage(Databases::new(app.path().app_data_dir().ok()));
             Ok(())
+        })
+        .on_page_load(|webview, payload| {
+            if !matches!(payload.event(), PageLoadEvent::Started) {
+                return;
+            }
+
+            let app = webview.app_handle().clone();
+            let webview = webview.label().to_owned();
+            tauri::async_runtime::spawn(async move {
+                if let Err(error) = app.sqlite().release_webview(&webview).await {
+                    tracing::error!(%error, webview, "releasing a replaced page's database handles failed");
+                }
+            });
         })
         .build()
 }

@@ -23,9 +23,17 @@ interface Rows {
 	rows: unknown[][];
 }
 
-/** A connection to one database file, shared by every `load` of that file. */
+interface Loaded {
+	handle: number;
+	path: string;
+}
+
+/** One handle to a database file's connection, which every `load` of that file shares. */
 export class Database {
-	private constructor(readonly path: string) {}
+	private constructor(
+		private readonly handle: number,
+		readonly path: string,
+	) {}
 
 	/**
 	 * Opens `path`, or attaches to its open connection. Without options it attaches whatever
@@ -39,12 +47,12 @@ export class Database {
 			);
 		}
 
-		const resolved = await invoke<string>(`${PLUGIN}|load`, {
+		const loaded = await invoke<Loaded>(`${PLUGIN}|load`, {
 			path,
 			config: options ? Database.config(options) : null,
 		});
 
-		return new Database(resolved);
+		return new Database(loaded.handle, loaded.path);
 	}
 
 	/** On a column name shared by two result columns, the later one wins. */
@@ -53,7 +61,7 @@ export class Database {
 		params: BindValue[] = [],
 	): Promise<T[]> {
 		const { columns, rows } = await invoke<Rows>(`${PLUGIN}|select`, {
-			db: this.path,
+			handle: this.handle,
 			sql,
 			params,
 		});
@@ -71,7 +79,7 @@ export class Database {
 		params: BindValue[] = [],
 	): Promise<ExecuteResult> {
 		return invoke<ExecuteResult>(`${PLUGIN}|execute`, {
-			db: this.path,
+			handle: this.handle,
 			sql,
 			params,
 		});
@@ -79,12 +87,17 @@ export class Database {
 
 	/** The database's own state, not a flag kept in JavaScript. */
 	async inTransaction(): Promise<boolean> {
-		return invoke<boolean>(`${PLUGIN}|in_transaction`, { db: this.path });
+		return invoke<boolean>(`${PLUGIN}|in_transaction`, {
+			handle: this.handle,
+		});
 	}
 
-	/** Closes the connection for every handle to this file. */
+	/**
+	 * Releases this handle, rolling back a transaction it began. The connection closes once no
+	 * handle and no Rust `load` still holds it.
+	 */
 	async close(): Promise<void> {
-		await invoke(`${PLUGIN}|close`, { db: this.path });
+		await invoke(`${PLUGIN}|close`, { handle: this.handle });
 	}
 
 	private static config(options: LoadOptions) {

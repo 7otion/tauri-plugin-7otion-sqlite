@@ -8,14 +8,17 @@ pub enum Error {
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
-    #[error("no database is loaded as {0}: it was never loaded, or it was closed")]
-    NotLoaded(String),
+    #[error(
+        "database handle {0} is not open: it was closed, its page reloaded, or its database was closed"
+    )]
+    UnknownHandle(u64),
 
     #[error("database {0} was closed")]
     Closed(String),
 
     #[error(
-        "database {0} is already open with a different configuration: close it, then load it again with the new one"
+        "database {0} is already open with a different configuration: release every handle to it, \
+         and close it from Rust if the app loaded it there, then load it again with the new one"
     )]
     ConfigMismatch(String),
 
