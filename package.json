@@ -1,0 +1,37 @@
+{
+	"name": "tauri-plugin-7otion-sqlite-api",
+	"version": "0.1.0",
+	"description": "JavaScript API for tauri-plugin-7otion-sqlite.",
+	"author": "Burak Kartal",
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "https://github.com/7otion/tauri-plugin-7otion-sqlite"
+	},
+	"type": "module",
+	"main": "./dist-js/index.js",
+	"types": "./dist-js/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist-js/index.d.ts",
+			"import": "./dist-js/index.js"
+		}
+	},
+	"files": [
+		"dist-js",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"build": "rm -rf dist-js && tsc",
+		"typecheck": "tsc --noEmit",
+		"format": "bunx prettier --write 'guest-js/**/*.ts' '*.json'"
+	},
+	"peerDependencies": {
+		"@tauri-apps/api": "^2.0.0"
+	},
+	"devDependencies": {
+		"@tauri-apps/api": "^2.11.1",
+		"typescript": "^6.0.3"
+	}
+}

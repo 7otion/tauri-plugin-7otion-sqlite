@@ -1,0 +1,17 @@
+{
+	"compilerOptions": {
+		"target": "es2022",
+		"module": "ESNext",
+		"lib": ["es2022", "DOM"],
+		"moduleResolution": "bundler",
+		"strict": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"noUncheckedIndexedAccess": true,
+		"skipLibCheck": true,
+		"declaration": true,
+		"rootDir": "./guest-js",
+		"outDir": "./dist-js"
+	},
+	"include": ["guest-js/**/*"]
+}
